@@ -1,0 +1,53 @@
+# Build output
+build/
+build/**
+obj/
+obj/**
+bin/
+bin/**
+sdl/build/
+sdl/build/**
+src/obj/
+src/obj/**
+*.o
+*.a
+*.so
+*.d
+*.elf
+*.map
+core_87000000*
+cores/eduke32/*.a
+sdl/*.a
+
+# Game data & copyrighted assets
+game/
+game/**
+*.GRP
+*.grp
+*.RTS
+*.rts
+*.EXE
+*.exe
+*.CON
+*.con
+*.DMO
+*.dmo
+*.7z
+*.zip
+*.log
+eduke32.cfg
+eduke32_trace.txt
+
+# Backups & internal git backups
+.git_backup/
+.git_backup/**
+*/.git_backup/
+*/.git_backup/**
+
+# Scratch output & logs
+frames/
+frames/**
+
+# Editor & OS files
+.DS_Store
+Thumbs.db

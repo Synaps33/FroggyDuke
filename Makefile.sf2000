@@ -1,0 +1,428 @@
+# EDuke32 for the Data Frog SF2000 / GB300.
+#
+#   make sf2000        -> build/sf2000/eduke32_libretro.a   (MIPS32r2, soft-float)
+#   make gb300         -> build/gb300/eduke32_libretro.a
+#   make sf2000-core   -> the above plus build/sf2000/core_87000000
+#   make gb300-core    -> the same for GB300V2
+#   make deploy-sf2000 -> build and copy onto the SD card
+#
+#   make gbsim         -> build/gbsim/eduke32_libretro.so    (host test model)
+#   make gb300runner   -> build/gbsim/gb300_runner
+#   make run-gbsim     -> drive the model through the runner, capture frames
+#
+#   make print-controls -> dump the pad -> action table
+#
+# Why the port looks the way it does
+# ---------------------------------
+# The console is a MIPS32 XBurst with no GPU, no FPU and no threads. Three
+# consequences run through the whole build:
+#
+#   * No GPU: there is no OpenGL. eduke32 builds with USE_OPENGL=0 POLYMER=0 and
+#     renders through BUILD's classic software path into an 8-bit paletted
+#     buffer, which softsurface then scales and converts to the RGB565 window
+#     surface the SDL2 shim presents. Presenting at 320x200 -- BUILD's native
+#     resolution -- means that blit runs 1:1 and costs nothing.
+#
+#   * No FPU: every float is soft-float. eduke32's own maths is fixed point, so
+#     the cost lands almost entirely in the rasteriser and in the palette fade.
+#
+#   * No threads: the game runs on a libco coroutine (libco/libco_sf2000.c, a
+#     setjmp/longjmp implementation that swaps $sp by hand, because this newlib
+#     has no makecontext) and the frontend's per-frame callback is the yield
+#     point.
+#
+# There is no x86 ASM renderer (NOASM=1) and no netcode (NETCODE=0), the same
+# combination RetroPie uses for its ARM builds.
+
+SHELL     := /bin/bash
+TOP       := $(CURDIR)
+
+MULTICORE ?= /home/Sajnaps/gb300/sf2000_multicore
+FROG      := /opt/frog-toolchain/mipsel-mti-elf_stable/bin/mipsel-mti-elf-
+CC_CROSS  := $(FROG)gcc
+CXX_CROSS := $(FROG)g++
+AR_CROSS  := $(FROG)ar
+RANLIB_CROSS := $(FROG)ranlib
+
+HOSTCC  ?= gcc
+HOSTCXX ?= g++
+HOSTAR  ?= ar
+
+LIBCO_MIPS := $(TOP)/platform/sf2000/libco/libco_sf2000.c
+LIBCO_HOST := $(MULTICORE)/libs/libretro-common/libco/libco.c
+
+# ---------------------------------------------------------------- eduke32
+#
+# The upstream makefile is left in charge of *which* sources go into the game,
+# the engine, audiolib and imgui -- that logic (which files are excluded for
+# which feature toggles) is not worth duplicating here and would drift. It is
+# handed the console's settings and asked for an archive instead of a hosted
+# executable; the sf2000-core target in its GNUmakefile does that.
+
+EDUKE_PLATFORM := \
+	SDL_TARGET=2 \
+	PLATFORM=SF2000 \
+	SDLCONFIG= \
+	NOASM=1 \
+	POLYMER=0 \
+	USE_OPENGL=0 \
+	USE_LIBVPX=0 \
+	NETCODE=0 \
+	HAVE_GTK2=0 \
+	STARTUP_WINDOW=0 \
+	USE_MIMALLOC=0 \
+	RETAIL_MENU=0 \
+	USE_PHYSFS=0 \
+	HAVE_VORBIS=0 \
+	HAVE_FLAC=0 \
+	HAVE_XMP=0 \
+	LTO=0 \
+	PRETTY_OUTPUT=0 \
+	OPTLEVEL=2 \
+	RELEASE=1
+
+# Forced into every translation unit:
+#
+#   -include std_threads_shim.h  the console's libstdc++ has no std::mutex,
+#                                 std::thread or std::to_string at all (see
+#                                 compat/std_threads_shim.h). The host model
+#                                 does not need it and must not have it, or it
+#                                 collides with the real ones.
+#   -Dmain=...                    so the same objects can also be linked into a
+#                                 standalone executable for host debugging.
+#   -D_POSIX_TIMERS               newlib gates nanosleep() on it.
+#   -Dmain=...                    see above.
+EDUKE_CUSTOMOPT := \
+	-I$(TOP)/thirdparty/include \
+	-I$(TOP)/thirdparty/include/SDL2 \
+	-I$(MULTICORE)/include \
+	-I$(TOP)/platform/sf2000 \
+	-I$(TOP)/platform/sf2000/compat \
+	-D_POSIX_TIMERS \
+	-DMICROPROFILE_ENABLED=0 \
+	-Dmain=eduke32_sf2000_main
+
+EDUKE_CUSTOMOPT_MIPS := $(EDUKE_CUSTOMOPT) -include std_threads_shim.h
+
+EDUKE_PLATFORM := $(EDUKE_PLATFORM) CUSTOMOPT="$(EDUKE_CUSTOMOPT_MIPS)"
+
+# SDLCONFIG must stay empty: there is no sdl-config on this host, and the
+# console has no real SDL. The port's shim provides the API.
+
+# ---------------------------------------------------------------- platform
+
+SF2000_DIR := $(TOP)/build/sf2000
+GB300_DIR  := $(TOP)/build/gb300
+GBSIM_DIR  := $(TOP)/build/gbsim
+
+SF2000_CORE := $(SF2000_DIR)/eduke32_libretro.a
+GB300_CORE  := $(GB300_DIR)/eduke32_libretro.a
+GBSIM_SO    := $(GBSIM_DIR)/eduke32_libretro.so
+
+# --- MIPS flags
+# -msoft-float and no hardware FP at all: this is the single biggest
+# performance decision in the build.
+# -G0: no small-data section, so the linker places globals normally. The console
+# firmware's loader is happier with a plain image and -G0 avoids .sdata/.sbss
+# overflow surprises on a 32 MB partition.
+ARCH_MIPS := -EL -march=mips32 -mtune=mips32 -msoft-float -G0 -mno-abicalls -fno-pic \
+             -ffunction-sections -fdata-sections -fomit-frame-pointer \
+             -fno-strict-aliasing -std=gnu++11 -O2
+
+DEFS_COMMON := -DSF2000 -DNDEBUG -DRENDERTYPESDL -DSDL_USEFOLDER -DLIBCO_C -D_POSIX_TIMERS
+
+# MIPS-only: the console's newlib has no sys/mman.h (see compat/sys/mman.h).
+# Deliberately not on the host include path, which has a real one.
+INC_MIPS := -I$(TOP)/platform/sf2000/compat
+
+INC_COMMON := \
+	-I$(TOP)/platform/sf2000 \
+	-I$(TOP)/platform/sf2000/libco \
+	-I$(MULTICORE)/libs/libretro-common/include \
+	-I$(MULTICORE)/libs/libretro-common/include/libretro-common \
+	-I$(MULTICORE)/include
+
+# SDL2 headers: the console has no SDL at all, only this port's shim. The real
+# SDL2 headers are vendored so that struct layouts and the scancode/keycode
+# tables match the shim's view of them exactly.
+SDL2_INC := -I$(TOP)/thirdparty/include -I$(TOP)/thirdparty/include/SDL2
+
+WARN_COMMON := -Wall -Wno-unused-variable -Wno-unused-parameter -Wno-sign-compare \
+               -Wno-unused-function -Wno-unused-but-set-variable -Wno-parentheses \
+               -Wno-char-subscripts -Wno-misleading-indentation -Wno-implicit-fallthrough \
+               -Wno-unknown-pragmas -Wno-strict-aliasing -Wno-uninitialized \
+               -Wno-nonnull -Wno-tautological-compare -Wno-deprecated-declarations \
+               -Wno-format-truncation -Wno-stringop-truncation -Wno-address-of-packed-member
+
+# This port's own translation units.
+PORT_SRC := \
+	platform/sf2000/libretro_core.cpp \
+	platform/sf2000/sdl2_shim.c \
+	platform/sf2000/sf2000_input.c \
+	platform/sf2000/hacker_loader.c \
+	platform/sf2000/eduke32_entry.cpp \
+	platform/sf2000/compat/libc_shim.c \
+	platform/sf2000/compat/sf2k_log.c \
+	platform/sf2000/libco/co_api.c
+
+# The shipped bindings are embedded into the core as a C string so that a core
+# dropped on the card as a single binary still installs them.
+platform/sf2000/default_autoexec.cfg.inc: platform/sf2000/default_autoexec.cfg
+	@echo "  GEN     $@"
+	@printf 'static const char kDefaultAutoexec[] =\n' > $@
+	@printf '' >> $@
+	@sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' $< >> $@
+	@printf ';\n' >> $@
+
+PORT_CPP   := $(filter %.cpp,$(PORT_SRC))
+PORT_C     := $(filter %.c,$(PORT_SRC))
+
+# The console has no libco makecontext, so it uses the setjmp/longjmp variant
+# that swaps $sp with inline MIPS asm. The host model cannot run that asm and
+# uses stock libco instead; see platform/sf2000/libco/co_api.c.
+LIBCO_SRC := platform/sf2000/libco/libco_sf2000.c
+
+# eduke32's own main() is renamed so the same archive can also be linked into a
+# standalone executable when debugging on the host.
+PORT_DEFS := -Dmain=eduke32_sf2000_main
+
+# ---------------------------------------------------------------- MIPS objects
+
+SF2000_PORT_OBJS := $(patsubst %.c,$(SF2000_DIR)/%.o,$(PORT_C)) \
+                    $(patsubst %.cpp,$(SF2000_DIR)/%.o,$(PORT_CPP)) \
+                    $(SF2000_DIR)/$(LIBCO_SRC:.c=.o)
+GB300_PORT_OBJS  := $(patsubst %.c,$(GB300_DIR)/%.o,$(PORT_C)) \
+                    $(patsubst %.cpp,$(GB300_DIR)/%.o,$(PORT_CPP)) \
+                    $(GB300_DIR)/$(LIBCO_SRC:.c=.o)
+
+$(SF2000_DIR)/platform/sf2000/eduke32_entry.o: platform/sf2000/default_autoexec.cfg.inc
+$(GB300_DIR)/platform/sf2000/eduke32_entry.o: platform/sf2000/default_autoexec.cfg.inc
+$(GBSIM_DIR)/platform/sf2000/eduke32_entry.o: platform/sf2000/default_autoexec.cfg.inc
+
+$(SF2000_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC      $<"
+	@$(CC_CROSS) -c $(ARCH_MIPS) $(DEFS_COMMON) $(INC_COMMON) $(INC_MIPS) $(SDL2_INC) \
+	    $(WARN_COMMON) -MMD -MP $< -o $@
+
+$(SF2000_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	@echo "  CXX     $<"
+	@$(CXX_CROSS) -c $(ARCH_MIPS) $(DEFS_COMMON) $(INC_COMMON) $(INC_MIPS) $(SDL2_INC) \
+	    $(WARN_COMMON) -MMD -MP $< -o $@
+
+$(GB300_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC      $<"
+	@$(CC_CROSS) -c $(ARCH_MIPS) $(DEFS_COMMON) -DFROGGY_TYPE_GB300V2 \
+	    $(INC_COMMON) $(INC_MIPS) $(SDL2_INC) $(WARN_COMMON) -MMD -MP $< -o $@
+
+$(GB300_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	@echo "  CXX     $<"
+	@$(CXX_CROSS) -c $(ARCH_MIPS) $(DEFS_COMMON) -DFROGGY_TYPE_GB300V2 \
+	    $(INC_COMMON) $(INC_MIPS) $(SDL2_INC) $(WARN_COMMON) -MMD -MP $< -o $@
+
+-include $(SF2000_PORT_OBJS:.o=.d) $(GB300_PORT_OBJS:.o=.d)
+
+# ---------------------------------------------------------------- archives
+#
+# The archive the multicore frontend links. eduke32's own makefile builds the
+# engine, game, audiolib and imgui objects; this merges them with the platform
+# layer above. Objects are unpacked rather than passed to ar directly, because
+# ar treats an archive operand as one opaque member.
+
+EDUKE_LIB := $(TOP)/src/obj/sf2000-core/eduke32_game.a
+
+sf2000: $(SF2000_CORE)
+gb300:  $(GB300_CORE)
+
+# eduke32's own makefile is the authority on what its objects depend on, so it
+# is consulted on every build and left to decide what (if anything) to recompile.
+.PHONY: eduke-force
+eduke-force:
+
+# The sub-make already writes the merged archive straight to $(EDUKE_LIB); the
+# recipe only has to create its directory.
+$(EDUKE_LIB): eduke-force
+	@mkdir -p $(dir $@)
+	@$(MAKE) --no-print-directory -C $(TOP)/src -f GNUmakefile $(EDUKE_PLATFORM) sf2000-core-lib
+	@test -f $@ || { echo "ERROR: $@ was not produced"; exit 1; }
+
+# `ar` treats an archive operand as a single opaque member, so eduke32's objects
+# have to be unpacked before they can be merged with this port's.
+define ARCHIVE_template
+$(2): $(EDUKE_LIB) $$($(1)_PORT_OBJS)
+	@echo "  AR      $$@"
+	@rm -f $$@
+	@rm -rf $(dir $(2))unpack; mkdir -p $(dir $(2))unpack
+	@( cd $(dir $(2))unpack && $(AR_CROSS) x $(EDUKE_LIB) ) || exit 1
+	$(AR_CROSS) rcs $$@ $(dir $(2))unpack/*.o $$($(1)_PORT_OBJS)
+	$(RANLIB_CROSS) $$@
+	@rm -rf $(dir $(2))unpack
+endef
+
+$(eval $(call ARCHIVE_template,SF2000,$(SF2000_CORE)))
+$(eval $(call ARCHIVE_template,GB300,$(GB300_CORE)))
+
+# ---------------------------------------------------------------- packaging
+
+# multicore keeps one build directory for both console types, and make cannot
+# see that FROGGY_TYPE changed the flags, so the previous console's binary
+# would otherwise be relinked and left in place. Drop it first; everything
+# upstream of it is still incremental. The stamp records which type the binary
+# in that directory actually is, so install-card cannot pair it with the wrong
+# card tree.
+MULTICORE_STAMP = $(MULTICORE)/build/.froggy_type
+
+sf2000-core: sf2000
+	@rm -f $(MULTICORE)/build/core_87000000
+	@$(MAKE) -C $(MULTICORE) CORE=$(TOP)/cores/eduke32 CONSOLE=eduke32 FROGGY_TYPE=SF2000 -j$(shell nproc)
+	@echo SF2000 > $(MULTICORE_STAMP)
+
+gb300-core: gb300
+	@rm -f $(MULTICORE)/build/core_87000000
+	@$(MAKE) -C $(MULTICORE) CORE=$(TOP)/cores/eduke32 CONSOLE=eduke32 FROGGY_TYPE=GB300V2 -j$(shell nproc)
+	@echo GB300V2 > $(MULTICORE_STAMP)
+
+# ---------------------------------------------------------------- gbsim
+#
+# There is no MIPS emulator on this host, so the console is *modelled*. What is
+# reproduced, and why it is the right pair of properties:
+#
+#   * no FPU: -mfpmath=387 puts every float on the x87 stack, and
+#     -mno-sse*/-mno-avx/-fno-tree-vectorize stops the compiler turning the
+#     rasteriser's inner loops into vector code. The console has no vector unit
+#     either, so this is the property that decides whether the frame rate works.
+#   * a 32 MB heap: enforced by the runner's --ram-mb 32 RLIMIT_AS.
+#
+# The 32-bit pointer model comes for free -- this host's gcc already defaults to
+# -m32, which is why the SDL build uses the same default.
+
+GBSIM_ARCH := -m32 -mfpmath=387 -mno-sse -mno-sse2 -mno-sse3 -mno-ssse3 \
+              -mno-sse4.1 -mno-sse4.2 -mno-avx -mno-avx2 -fno-tree-vectorize
+
+GBSIM_INC := $(INC_COMMON) $(SDL2_INC) -I/usr/include/x86_64-linux-gnu
+GBSIM_DEFS := $(DEFS_COMMON) -DFROGGY_TYPE_SF2000
+GBSIM_CFLAGS := $(GBSIM_ARCH) -O2 -g -fPIC -fno-strict-aliasing -std=gnu++11 \
+                $(GBSIM_DEFS) $(WARN_COMMON)
+
+GBSIM_PORT_SRC := $(PORT_SRC) $(LIBCO_HOST)
+GBSIM_PORT_OBJS := $(patsubst %.c,$(GBSIM_DIR)/%.o,$(filter %.c,$(GBSIM_PORT_SRC))) \
+                   $(patsubst %.cpp,$(GBSIM_DIR)/%.o,$(filter %.cpp,$(GBSIM_PORT_SRC)))
+
+# eduke32 itself, built with the host compiler but the console's configuration,
+# so the model differs from the card only in the instruction set.
+EDUKE_HOST := $(GBSIM_DIR)/eduke32_game.a
+# Same configuration, host compiler. $(subst) with an undefined left-hand side
+# silently deletes text, so spell the substitution out.
+EDUKE_HOST_PLATFORM := $(patsubst PLATFORM=SF2000,PLATFORM=SF2000_HOST,$(EDUKE_PLATFORM)) \
+	CUSTOMOPT="$(EDUKE_CUSTOMOPT)"
+
+gbsim: $(GBSIM_SO)
+
+$(EDUKE_HOST): eduke-force
+	@$(MAKE) --no-print-directory -C $(TOP)/src -f GNUmakefile \
+	    $(EDUKE_HOST_PLATFORM) -j$(shell nproc) \
+	    obj=$(GBSIM_DIR)/objs sf2000-core-lib
+	@mkdir -p $(dir $@)
+	@cp -f $(GBSIM_DIR)/objs/sf2000-core/eduke32_game.a $@
+
+$(GBSIM_SO): $(EDUKE_HOST) $(GBSIM_PORT_OBJS)
+	@echo "  LD      $@"
+	@rm -f $@
+	@rm -rf $(GBSIM_DIR)/unpack; mkdir -p $(GBSIM_DIR)/unpack
+	@( cd $(GBSIM_DIR)/unpack && $(HOSTAR) x $(EDUKE_HOST) ) || exit 1
+	@$(HOSTCXX) $(GBSIM_ARCH) -shared -o $@ $(GBSIM_DIR)/unpack/*.o $(GBSIM_PORT_OBJS) -lm -ldl
+	@rm -rf $(GBSIM_DIR)/unpack
+
+$(GBSIM_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  HOSTCC  $<"
+	@$(HOSTCC) -c $(GBSIM_CFLAGS) $(GBSIM_INC) -MMD -MP $< -o $@
+
+$(GBSIM_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	@echo "  HOSTCXX $<"
+	@$(HOSTCXX) -c $(GBSIM_CFLAGS) $(GBSIM_INC) -MMD -MP $< -o $@
+
+gb300runner: $(GBSIM_DIR)/gb300_runner
+
+$(GBSIM_DIR)/gb300_runner: runner/gb300_runner.c
+	@mkdir -p $(dir $@)
+	@echo "  LD      $@"
+	@$(HOSTCC) $(GBSIM_ARCH) -O2 -g -I$(MULTICORE)/libs/libretro-common/include \
+	    -I$(TOP)/thirdparty/include -o $@ $< -ldl
+
+# run-gbsim [frames] [dump-every] [data-dir] [script]
+run-gbsim: gbsim gb300runner
+	@mkdir -p $(GBSIM_DIR)/frames
+	@$(GBSIM_DIR)/gb300_runner $(GBSIM_SO) \
+	    $(or $(3),$(TOP)/game) $(or $(1),600) $(or $(2),60) \
+	    --ram-mb 32 --verbose "$(or $(4),)"
+
+print-controls: gbsim
+	@$(GBSIM_DIR)/print_controls
+
+# ---------------------------------------------------------------- card
+#
+# The console mounts the card at /mnt/sda1 (see sf2000_multicore/file.h), so
+# the host-side tree mirrors it one-to-one. The card's FrogUI build (system/
+# Deimos/cores/menu.sf2k) is newer than the multicore checkout used to build,
+# and works differently:
+#
+#   /ROMS/<console>/            games, one folder per console
+#   /system/Deimos/cores/*.sf2k  core binaries
+#   /configs/custom_cores/<core>/games.opt  maps a ROM file to a core that is
+#                               not in FrogUI's built-in console table; one
+#                               "<rom filename>|<core>" line per entry
+#
+# FrogUI builds its own "[core];[romfile].gba" launcher stubs under /ROMS from
+# that mapping, so there is no stub to ship by hand -- writing one was the old
+# multicore convention and this firmware ignores it.
+
+SDCARD       ?= /media/Sajnaps/GB300
+CONSOLE_TYPE ?= GB300V2
+
+EDUKE_DATA       = $(SDCARD)/ROMS/eduke32
+EDUKE_CORE_DIR   = $(SDCARD)/system/Deimos/cores
+EDUKE_CORE       = $(EDUKE_CORE_DIR)/eduke32.sf2k
+EDUKE_OPT_DIR    = $(SDCARD)/configs/custom_cores/eduke32
+EDUKE_GAMES_OPT  = $(EDUKE_OPT_DIR)/games.opt
+EDUKE_SHAREWARE  = $(TOP)/game
+EDUKE_EMPTY_CACHE = $(SDCARD)/configs/frogui_empty_dirs.cache
+
+install-card:
+	@mkdir -p "$(EDUKE_DATA)" "$(EDUKE_CORE_DIR)" "$(EDUKE_OPT_DIR)"
+	@test -f $(MULTICORE)/build/core_87000000 || \
+	    { echo "ERROR: no core built yet (run 'make -f Makefile.sf2000 sf2000-core')"; exit 1; }
+	@test -f $(MULTICORE_STAMP) || \
+	    { echo "ERROR: $(MULTICORE_STAMP) missing; run sf2000-core or gb300-core first"; exit 1; }
+	@test "$$(cat $(MULTICORE_STAMP))" = "$(CONSOLE_TYPE)" || \
+	    { echo "ERROR: core_87000000 is a $$(cat $(MULTICORE_STAMP)) build, not $(CONSOLE_TYPE)."; \
+	      echo "       run 'make -f Makefile.sf2000 $(if $(filter GB300V2,$(CONSOLE_TYPE)),gb300,sf2000)-core' first."; exit 1; }
+	@cp -f $(MULTICORE)/build/core_87000000 "$(EDUKE_CORE)"
+	@for f in DUKE3D.GRP DUKE.RTS; do \
+	    test -f "$(EDUKE_SHAREWARE)/$$f" || { echo "ERROR: missing $$f in $(EDUKE_SHAREWARE)"; exit 1; }; \
+	    cp -f "$(EDUKE_SHAREWARE)/$$f" "$(EDUKE_DATA)/$$f"; \
+	done
+	@printf 'DUKE3D.GRP|eduke32\nDUKE.RTS|eduke32\n' > "$(EDUKE_GAMES_OPT)"
+	@rm -f "$(EDUKE_EMPTY_CACHE)"
+	@echo "core   -> $(EDUKE_CORE)"
+	@echo "data   -> $(EDUKE_DATA)"
+	@echo "map    -> $(EDUKE_GAMES_OPT)"
+
+deploy-sf2000: sf2000-core
+	@$(MAKE) -f Makefile.sf2000 install-card CONSOLE_TYPE=SF2000
+
+deploy-gb300: gb300-core
+	@$(MAKE) -f Makefile.sf2000 install-card CONSOLE_TYPE=GB300V2
+
+clean:
+	@rm -rf $(SF2000_DIR) $(GB300_DIR) $(GBSIM_DIR)
+	@$(MAKE) -C $(TOP)/src -f GNUmakefile $(EDUKE_PLATFORM) clean || true
+	@$(MAKE) -C $(TOP)/sdl clean || true
+	@rm -f cores/eduke32/*.a
+
+.PHONY: all sf2000 gb300 sf2000-core gb300-core gbsim gb300runner run-gbsim \
+        print-controls install-card deploy-sf2000 deploy-gb300 clean
